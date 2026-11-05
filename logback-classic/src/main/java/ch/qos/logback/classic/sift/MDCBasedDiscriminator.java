@@ -14,7 +14,9 @@
 package ch.qos.logback.classic.sift;
 
 import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.CoreConstants;
 import ch.qos.logback.core.sift.AbstractDiscriminator;
+import ch.qos.logback.core.spi.ScanException;
 import ch.qos.logback.core.util.OptionHelper;
 
 import java.util.Map;
@@ -28,8 +30,8 @@ import java.util.Map;
  * </p>
  * <p>
  * MDC values which could point outside the directory of a file name built from
- * them, e.g. {@code ../x} or {@code /x}, are rejected and the DefaultValue is
- * returned instead.
+ * them, e.g. {@code ../x}, {@code /x}, {@code x${file.separator}..} or
+ * {@code x%d{/.}.}, are rejected and the DefaultValue is returned instead.
  * </p>
  *
  * @author Ceki G&uuml;lc&uuml;
@@ -40,6 +42,14 @@ public class MDCBasedDiscriminator extends AbstractDiscriminator<ILoggingEvent> 
     private static final char BACKWARD_SLASH = '\\';
     private static final char DOT = '.';
     private static final char SPACE = ' ';
+    private static final char PERCENT = '%';
+    private static final String VARIABLE_START = "${";
+    private static final String REGEX_ALTERNATION_AND_CLASS_CHARACTERS = "|[]";
+    private static final String REGEX_QUANTIFIER_CHARACTERS = "+*?";
+    private static final char RIGHT_PARENTHESIS = ')';
+    private static final char LEFT_BRACE = '{';
+    private static final char RIGHT_BRACE = '}';
+    private static final char COMMA = ',';
 
     private String key;
     private String defaultValue;
@@ -80,6 +90,34 @@ public class MDCBasedDiscriminator extends AbstractDiscriminator<ILoggingEvent> 
      * the official fix. A bare {@code C:x} is accepted, as in the official fix.
      * </p>
      * <p>
+     * It is also the case if the value contains {@code ${}, which the nested
+     * configuration would expand as a variable reference such as
+     * <code>${file.separator}</code>, or {@code %}, which a rolling file name
+     * pattern would expand as a conversion such as <code>%d{/}</code>. Both can
+     * produce path separators and parent references which are not visible in the
+     * value itself.
+     * </p>
+     * <p>
+     * A rolling file name pattern copies the value unescaped into the regex which
+     * selects archived files for removal, so values are rejected as well if they
+     * contain {@code |}, {@code [} or {@code ]}, or a quantifier which could apply
+     * to more than a literal character of the value and let a value such as
+     * {@code .+} match the archives of other values: {@code +}, {@code *} or
+     * {@code ?} as the first character or right after {@code .} or {@code )}, or
+     * a repetition such as {@code {2}} or <code>{0,40}</code>.
+     * </p>
+     * <p>
+     * The nested configuration also parses the value again, where a {@code :-}
+     * outside a variable reference or an unmatched <code>}</code> ends it, so
+     * {@code ..:-x} or <code>..}x</code> turns into {@code ..}. Such a value is
+     * rejected if what is left of it is.
+     * </p>
+     * <p>
+     * An empty value is rejected too, since it disappears from the file name and
+     * can turn a relative path such as <code>${key}/app.log</code> into an
+     * absolute one.
+     * </p>
+     * <p>
      * Separators inside the value are allowed, so that values such as
      * {@code tenantA/user1} keep mapping to nested directories.
      * </p>
@@ -100,8 +138,10 @@ public class MDCBasedDiscriminator extends AbstractDiscriminator<ILoggingEvent> 
         // logback-core trims the file name, so " /x" turns into the absolute path "/x"
         value = value.trim();
         final int len = value.length();
+        // an empty value disappears from the file name, so a template such as
+        // "${key}/app.log" would turn into the absolute path "/app.log"
         if (len == 0) {
-            return true;
+            return false;
         }
         char first = value.charAt(0);
         if (isPathSeparator(first)) {
@@ -112,6 +152,24 @@ public class MDCBasedDiscriminator extends AbstractDiscriminator<ILoggingEvent> 
         if (len > 1 && value.charAt(1) == ':' && isAsciiLetter(first)
                 && (value.indexOf(FORWARD_SLASH) != -1 || value.indexOf(BACKWARD_SLASH) != -1
                         || value.contains(".."))) {
+            return false;
+        }
+        if (value.indexOf(VARIABLE_START) != -1 || value.indexOf(PERCENT) != -1) {
+            return false;
+        }
+        for (int i = 0; i < REGEX_ALTERNATION_AND_CLASS_CHARACTERS.length(); i++) {
+            if (value.indexOf(REGEX_ALTERNATION_AND_CLASS_CHARACTERS.charAt(i)) != -1) {
+                return false;
+            }
+        }
+        if (containsRegexQuantifier(value)) {
+            return false;
+        }
+        // the nested configuration parses the value again, where a ":-" outside a
+        // variable reference or an unmatched '}' ends it, so "..:-x" turns into "..";
+        // parsing what is left again returns it unchanged
+        String parsed = parsedByNestedConfiguration(value);
+        if (!parsed.equals(value) && !isSafeDiscriminatingValue(parsed)) {
             return false;
         }
 
@@ -141,6 +199,73 @@ public class MDCBasedDiscriminator extends AbstractDiscriminator<ILoggingEvent> 
             }
         }
         return true;
+    }
+
+    // only called once values containing "${" are rejected, so no variable is looked up
+    private static String parsedByNestedConfiguration(String value) {
+        if (value.indexOf(CoreConstants.CURLY_RIGHT) == -1
+                && !value.contains(CoreConstants.DEFAULT_VALUE_SEPARATOR)) {
+            return value;
+        }
+        try {
+            return OptionHelper.substVars(value, null, null);
+        } catch (ScanException | RuntimeException e) {
+            // the nested configuration fails on it too and builds no file name from it;
+            // its parser throws an IllegalArgumentException on input such as "{}{"
+            return value;
+        }
+    }
+
+    /**
+     * Returns {@code true} if the value contains a regex quantifier which could
+     * apply to more than a literal character of the value: {@code +}, {@code *} or
+     * {@code ?} as the first character, where a literal of the file name template
+     * such as {@code .} may precede it, or right after {@code .} or {@code )}; or
+     * a repetition matching <code>\{\d+(,\d*)?\}</code>.
+     */
+    private static boolean containsRegexQuantifier(String value) {
+        final int len = value.length();
+        for (int i = 0; i < len; i++) {
+            char c = value.charAt(i);
+            if (REGEX_QUANTIFIER_CHARACTERS.indexOf(c) != -1) {
+                if (i == 0) {
+                    return true;
+                }
+                char previous = value.charAt(i - 1);
+                if (previous == DOT || previous == RIGHT_PARENTHESIS) {
+                    return true;
+                }
+            } else if (c == LEFT_BRACE && isRepetitionAt(value, i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns {@code true} if the value matches <code>\{\d+(,\d*)?\}</code> at
+     * index {@code i}, which holds a <code>{</code>.
+     */
+    private static boolean isRepetitionAt(String value, int i) {
+        final int len = value.length();
+        int j = i + 1;
+        while (j < len && isAsciiDigit(value.charAt(j))) {
+            j++;
+        }
+        if (j == i + 1) {
+            return false;
+        }
+        if (j < len && value.charAt(j) == COMMA) {
+            j++;
+            while (j < len && isAsciiDigit(value.charAt(j))) {
+                j++;
+            }
+        }
+        return j < len && value.charAt(j) == RIGHT_BRACE;
+    }
+
+    private static boolean isAsciiDigit(char c) {
+        return c >= '0' && c <= '9';
     }
 
     private static boolean isPathSeparator(char c) {

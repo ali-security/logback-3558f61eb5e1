@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE configuration>
+
+<configuration debug="false">
+
+	<appender name="SIFT" class="ch.qos.logback.classic.sift.SiftingAppender">
+
+		<discriminator>
+			<Key>collision</Key>
+			<defaultValue>collisionDefault</defaultValue>
+		</discriminator>
+		<sift>
+			<appender name="ROLL-${collision}" class="ch.qos.logback.core.rolling.RollingFileAppender">
+				<rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+					<fileNamePattern>${DIR_PREFIX}/roll-${collision}-%d{yyyy-MM-dd}.txt</fileNamePattern>
+				</rollingPolicy>
+				<encoder>
+					<pattern>%logger{35} - %msg%n</pattern>
+				</encoder>
+			</appender>
+		</sift>
+	</appender>
+	
+	<root level="DEBUG">
+		<appender-ref ref="SIFT" />
+	</root>
+
+</configuration>

@@ -274,6 +274,85 @@ public class SiftingAppenderTest {
         assertFalse(escapedFile.exists());
     }
 
+    /**
+     * Variable references such as <code>${file.separator}</code> combined with
+     * '..' in an MDC value must not allow a nested FileAppender to write outside
+     * the directory configured in the sift element.
+     */
+    @Test
+    public void pathTraversalViaVariableSubstitutionInMdcValueIsPrevented() throws JoranException, IOException {
+        loggerContext.putProperty("DIR_PREFIX", randomOutputDir);
+        assertTrue(new File(randomOutputDir + "log-x").mkdirs());
+        configure(SIFT_FOLDER_PREFIX + "fileAppender.xml");
+        SiftingAppender sa = (SiftingAppender) root.getAppender("SIFT");
+
+        String escapedName = "escaped-" + diff + ".txt";
+        logbackMDCAdapter.put("collision", "x${file.separator}..${file.separator}..${file.separator}escaped-" + diff);
+        logNewEventViaSiftingAppender(sa, System.currentTimeMillis());
+
+        FileAppender<ILoggingEvent> fileAppender = singleFileAppender(sa);
+        File logFile = new File(fileAppender.getFile()).getCanonicalFile();
+        assertEquals(new File(randomOutputDir).getCanonicalFile(), logFile.getParentFile());
+        assertEquals("log-collisionDefault.txt", logFile.getName());
+        assertFalse(new File(CoreTestConstants.OUTPUT_DIR_PREFIX + escapedName).exists());
+    }
+
+    /**
+     * Date conversions such as <code>%d{/.}</code> in an MDC value must not allow
+     * a nested RollingFileAppender to write outside the directory configured in
+     * its file name pattern.
+     */
+    @Test
+    public void pathTraversalViaFileNamePatternInMdcValueIsPrevented() throws JoranException, IOException {
+        loggerContext.putProperty("DIR_PREFIX", randomOutputDir);
+        assertTrue(new File(randomOutputDir + "roll-x").mkdirs());
+        configure(SIFT_FOLDER_PREFIX + "rollingFileAppender.xml");
+        SiftingAppender sa = (SiftingAppender) root.getAppender("SIFT");
+
+        String escapedPrefix = "escaped-" + diff;
+        logbackMDCAdapter.put("collision", "x%d{/.,aux}.%d{/.,aux}.%d{/,aux}" + escapedPrefix);
+        logNewEventViaSiftingAppender(sa, System.currentTimeMillis());
+
+        FileAppender<ILoggingEvent> fileAppender = singleFileAppender(sa);
+        File logFile = new File(fileAppender.getFile()).getCanonicalFile();
+        assertEquals(new File(randomOutputDir).getCanonicalFile(), logFile.getParentFile());
+        assertTrue(logFile.getName().startsWith("roll-collisionDefault-"), logFile.getName());
+        String[] escaped = new File(CoreTestConstants.OUTPUT_DIR_PREFIX).list((dir, name) -> name.startsWith(escapedPrefix));
+        assertEquals(0, escaped == null ? 0 : escaped.length);
+    }
+
+    /**
+     * The nested configuration parses the MDC value again, where a ":-" outside a
+     * variable reference or an unmatched '}' ends it, so neither may cut the value
+     * down to a parent reference such as "..".
+     */
+    @Test
+    public void pathTraversalViaDefaultValueSeparatorInMdcValueIsPrevented() throws JoranException, IOException {
+        assertNestedValueStaysInBounds("..:-x");
+    }
+
+    @Test
+    public void pathTraversalViaUnmatchedCurlyBraceInMdcValueIsPrevented() throws JoranException, IOException {
+        assertNestedValueStaysInBounds("..}x");
+    }
+
+    private void assertNestedValueStaysInBounds(String mdcValue) throws JoranException, IOException {
+        String dirPrefix = randomOutputDir + "inner";
+        loggerContext.putProperty("DIR_PREFIX", dirPrefix);
+        assertTrue(new File(dirPrefix).mkdirs());
+        configure(SIFT_FOLDER_PREFIX + "nestedDirectoryFileAppender.xml");
+        SiftingAppender sa = (SiftingAppender) root.getAppender("SIFT");
+
+        logbackMDCAdapter.put("collision", mdcValue);
+        logNewEventViaSiftingAppender(sa, System.currentTimeMillis());
+
+        FileAppender<ILoggingEvent> fileAppender = singleFileAppender(sa);
+        File logFile = new File(fileAppender.getFile()).getCanonicalFile();
+        assertEquals(new File(dirPrefix, "collisionDefault").getCanonicalFile(), logFile.getParentFile());
+        assertEquals("x.txt", logFile.getName());
+        assertFalse(new File(randomOutputDir + "x.txt").exists());
+    }
+
     private FileAppender<ILoggingEvent> singleFileAppender(SiftingAppender sa) {
         Collection<Appender<ILoggingEvent>> appenders = sa.getAppenderTracker().allComponents();
         assertEquals(1, appenders.size());
