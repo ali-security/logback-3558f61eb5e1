@@ -163,7 +163,8 @@ public class SMTPAppender_GreenTest {
     void waitUntilEmailIsSent() throws InterruptedException {
         ExecutorService es = loggerContext.getExecutorService();
         es.shutdown();
-        boolean terminated = es.awaitTermination(1000, TimeUnit.MILLISECONDS);
+        // sealed: 1000ms is too tight on slow CI runners (macOS took ~2.1s); allow 10s
+        boolean terminated = es.awaitTermination(10000, TimeUnit.MILLISECONDS);
         // this assertion may be needlessly strict
         if(!terminated) {
             fail("executor elapsed before accorded delay");
